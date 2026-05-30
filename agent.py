@@ -12,10 +12,8 @@ CRITICAL DIRECTIVES:
 2. First, use 'write_todos' to plan which modules, directories, and files you need to audit.
 3. Read the entry points and code structure (using 'ls', 'read_file', 'glob', etc.) to understand functional dependencies.
 4. Create clear, concise, and structured documentation files. Recommended files to write inside the `docs/` folder:
-   - `docs/overview.md`: Summary of the project, features, and folder structure.
-   - `docs/architecture.md`: Conceptual explanation of design, modules, and how they interact.
-   - `docs/api_reference.md` or component specific markdown files: Details on main classes, functions, and workflows.
-5. Make sure the documentation is extremely detailed, readable, and polished. Do not leave placeholder text.
+   - `docs/overview.md`: Summary of the project, features, and folder structure.Conceptual explanation of design, modules, and how they interact.
+5. Do not leave placeholder text.
 """
 
 async def run_doc_agent(target_directory: str, specific_instructions: str = ""):

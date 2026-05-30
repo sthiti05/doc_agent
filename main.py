@@ -17,7 +17,7 @@ load_dotenv()
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CLI Documentation Writer - Automate generating beautiful markdown docs for your codebases."
+        description="CLI Documentation Writer - Automate generating markdown docs for your codebases."
     )
     parser.add_argument(
         "directory",

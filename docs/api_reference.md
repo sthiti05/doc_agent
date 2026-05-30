@@ -244,11 +244,7 @@ def get_model() -> Union[ChatOpenAI, ChatGoogleGenerativeAI]
    - Default model is `"gpt-4o-mini"` if nothing is configured.
    - Returns `ChatOpenAI(model=model_name, api_key=openai_key, base_url=base_url if base_url else None)`.
 
-**DeepSeek Key Format**:
-```
-sk-5d63e78b553a431fbc7c618db5e3e1e0
-#     ^--- exactly 32 hex characters after "sk-"
-```
+
 
 **Example `.env` configurations**:
 
