@@ -1,7 +1,7 @@
 import os
 import asyncio
 from langchain_openai import ChatOpenAI
-from deepagents import create_deep_agent
+from deepagents import create_deep_agent, FilesystemPermission
 from deepagents.backends import FilesystemBackend
 
 DOC_INSTRUCTIONS = """You are an expert technical writer and software architect.
@@ -14,6 +14,7 @@ CRITICAL DIRECTIVES:
 4. Create clear, concise, and structured documentation files. Recommended files to write inside the `docs/` folder:
    - `docs/overview.md`: Summary of the project, features, and folder structure.Conceptual explanation of design, modules, and how they interact.
 5. Do not leave placeholder text.
+6. NEVER read, open, or reference the `.env` or `.gitignore` files. These files contain sensitive configuration and must be completely ignored.
 """
 
 async def run_doc_agent(target_directory: str, specific_instructions: str = ""):
@@ -26,10 +27,18 @@ async def run_doc_agent(target_directory: str, specific_instructions: str = ""):
     
     model = get_model()
 
+    # Deny the agent from reading sensitive/config files
+    denied_files = FilesystemPermission(
+        operations=["read"],
+        paths=["/.env", "/.gitignore"],
+        mode="deny",
+    )
+
     agent = create_deep_agent(
         model,
-        backend=FilesystemBackend(root_dir=abs_target_dir, virtual_mode=False),
+        backend=FilesystemBackend(root_dir=abs_target_dir, virtual_mode=True),
         system_prompt=DOC_INSTRUCTIONS,
+        permissions=[denied_files],
     )
     
     prompt = (

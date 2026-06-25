@@ -35,7 +35,7 @@ def main():
     args = parser.parse_args()
     
 
-    print("         DOCUMENTATION WRITER             ")
+    print("DOCUMENTATION WRITER")
 
     print(f"Target Directory: {args.directory}")
     if args.instructions:
@@ -45,12 +45,12 @@ def main():
     try:
         # run_doc_agent is async, so we run it using asyncio
         result = asyncio.run(run_doc_agent(args.directory, args.instructions))
-        print("\n====================================================")
-        print("🎉 Documentation Process Completed successfully!")
-        print("====================================================")
+        print("\n")
+        print("Documentation Process Completed successfully!")
+        print("\n")
         print(result)
     except Exception as e:
-        print(f"\n❌ Error running documentation agent: {e}", file=sys.stderr)
+        print(f"\nError running documentation agent: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
