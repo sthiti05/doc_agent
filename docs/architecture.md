@@ -1,6 +1,6 @@
 # Doc Agent — Architecture
 
-This document describes the conceptual architecture of the Doc Agent, the key design patterns used, and how the modules interact during a documentation run.
+This document describes the conceptual architecture of Doc Agent, the key design patterns used, and how the modules interact during a documentation run.
 
 ---
 
@@ -21,29 +21,27 @@ User (CLI)
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  agent.py                                                    │
-│  ┌──────────────┐   ┌──────────────────┐   ┌──────────────┐ │
-│  │ get_model()  │──▶│ create_deep_agent│──▶│ agent.ainvoke│ │
-│  │ (LLM select) │   │ (build agent)    │   │ (run audit)  │ │
-│  └──────────────┘   └──────────────────┘   └──────┬───────┘ │
-└──────────────────────────────────────────────────┼──────────┘
-                                                    │
-                                                    ▼
-                               ┌──────────────────────────────────────────────┐
-                               │  Deep Agent (DeepAgents Framework)           │
-                               │  ┌────────────────────────────────────────┐  │
-                               │  │ Tool inventory:                       │  │
-                               │  │  • write_todos — task planning        │  │
-                               │  │  • ls — list directory contents        │  │
-                               │  │  • read_file — read file contents      │  │
-                               │  │  • write_file — write/create files     │  │
-                               │  │  • edit_file — edit existing files     │  │
-                               │  │  • glob — pattern-based file search    │  │
-                               │  │  • grep — text search within files     │  │
-                               │  └────────────────────────────────────────┘  │
-                               │  • Backend: FilesystemBackend(root_dir)     │
-                               │  • System prompt: DOC_INSTRUCTIONS          │
-                               │  • Explores → Plans → Writes docs/         │
-                               └──────────────────────────────────────────────┘
+│  ┌──────────────┐   ┌────────────────────┐   ┌──────────┐   │
+│  │ get_model()  │──▶│ create_deep_agent  │──▶│ astream  │   │
+│  │ (LLM select) │   │ (build agent +     │   │ (stream  │   │
+│  │              │   │  permissions)      │   │  events) │   │
+│  └──────────────┘   └────────────────────┘   └──────────┘   │
+└──────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+               ┌──────────────────────────────────────────────┐
+               │  Deep Agent (DeepAgents Framework)           │
+               │  ┌────────────────────────────────────────┐  │
+               │  │ Tools: write_todos · ls · glob         │  │
+               │  │        grep · read_file · write/       │  │
+               │  │        edit_file                       │  │
+               │  └────────────────────────────────────────┘  │
+               │  Backend: FilesystemBackend(root_dir,       │
+               │           virtual_mode=True)                 │
+               │  Permissions: deny reads of .env/.gitignore │
+               │  Prompt: DOC_INSTRUCTIONS                    │
+               │  Explores → Plans → Writes docs/             │
+               └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -55,93 +53,83 @@ User (CLI)
 **Responsibility**: Parse command-line arguments, bootstrap async execution, and display results.
 
 **Data flow**:
-1. User runs `python main.py <directory> [--instructions <text>]`
-2. `argparse.ArgumentParser` parses the positional `directory` argument (defaults to `"."`) and optional `--instructions` / `-i` flag
-3. The module prints a styled ASCII banner showing the target directory and any custom instructions
-4. `load_dotenv()` loads environment variables from `.env`
-5. `asyncio.run(run_doc_agent(...))` launches the async documentation agent
-6. On success, the agent's final response is printed to stdout
-7. On failure, the exception is printed to stderr and the process exits with code 1
+1. At import time, reconfigure stdout/stderr to UTF-8 when running on Windows so emoji and Markdown render correctly in `cmd.exe` / PowerShell.
+2. `load_dotenv()` loads environment variables from `.env` (before any agent logic runs).
+3. `argparse.ArgumentParser` parses:
+   - `directory` (positional, optional) — target codebase path, defaults to `"."`
+   - `--instructions` / `-i` — custom guidance text
+   - `--api-key` / `-k` — explicit LLM API key
+   - `--model` / `-m` — model name override
+   - `--base-url` — custom OpenAI-compatible base URL
+4. Prints a styled ASCII banner summarizing the configuration.
+5. Calls `asyncio.run(run_doc_agent(directory, instructions, api_key=..., model_name=..., base_url=...))`.
+6. On success, prints a success banner and the agent's final response.
+7. On failure, prints the exception to stderr and calls `sys.exit(1)`.
 
-**Key behaviors**:
-- **UTF-8 Windows fix**: If running on Windows, `sys.stdout.reconfigure(encoding="utf-8")` and `sys.stderr.reconfigure(encoding="utf-8")` are called, ensuring emoji (📝, 🚀, ❌) and Markdown symbols render correctly in `cmd.exe` and PowerShell.
-- **`.env` loading**: `load_dotenv()` is called at module import time, before any agent startup logic, so all API keys are available when `agent.py` initializes the LLM.
+**Console script**: declared in `pyproject.toml` as `doc-agent = "main:main"`, so the tool is invoked as the `doc-agent` command.
 
 ### 2. `agent.py` — Agent Orchestration & LLM Routing
 
-**Responsibility**: Select the appropriate LLM, create the deep agent with a filesystem-backed toolset, and invoke it against the target codebase.
+**Responsibility**: Select the appropriate LLM, build the deep agent with a scoped filesystem toolset and security deny-rules, invoke it, and stream activity to the console.
 
 ```
-run_doc_agent(target_directory, specific_instructions)
-  ├── get_model()                  → ChatOpenAI | ChatGoogleGenerativeAI
-  ├── create_deep_agent(
+run_doc_agent(target_directory, specific_instructions, *,
+              api_key=None, model_name=None, base_url=None)
+  ├── abs_target_dir = abspath(target_directory)
+  ├── model = get_model(api_key=..., model_name=..., base_url=...)
+  ├── denied_files = FilesystemPermission(operations=["read"],
+  │       paths=["/.env","/**/.env","/.gitignore","/**/.gitignore"],
+  │       mode="deny")
+  ├── agent = create_deep_agent(
   │       model,
-  │       backend=FilesystemBackend(root_dir, virtual_mode=False),
-  │       system_prompt=DOC_INSTRUCTIONS
+  │       backend=FilesystemBackend(root_dir=abs_target_dir, virtual_mode=True),
+  │       system_prompt=DOC_INSTRUCTIONS,
+  │       permissions=[denied_files],
   │   )
-  └── agent.ainvoke({messages: [...]}) → result
+  └── async for event in agent.astream({messages: [...]}):
+        → stream tool outputs, tool calls, and model responses to console
 ```
 
 **`get_model()` — LLM Routing Logic**:
 
-```
-get_model()
-  │
-  ├── 1. Read env vars: OPENAI_API_KEY, GOOGLE_API_KEY, GEMINI_API_KEY
-  │
-  ├── 2. Strip whitespace from all found keys
-  │
-  ├── 3. Is GOOGLE_API_KEY / GEMINI_API_KEY set?
-  │     YES → Determine model name:
-  │       MODEL_NAME → GOOGLE_MODEL_NAME → "gemini-1.5-flash" (default)
-  │     → ChatGoogleGenerativeAI(model, google_api_key)
-  │
-  ├── 4. Is OPENAI_API_KEY set?
-  │     │
-  │     ├── 4a. Does key match DeepSeek format (sk- + 32 hex chars)?
-  │     │     YES → Auto-set base_url="https://api.deepseek.com"
-  │     │           Auto-set model="deepseek-chat"
-  │     │           → ChatOpenAI(model, api_key, base_url)
-  │     │
-  │     └── 4b. NO → Use configured OPENAI_BASE_URL (if any)
-  │                  Use configured MODEL_NAME or default "gpt-4o-mini"
-  │                  → ChatOpenAI(model, api_key, base_url)
-  │
-  └── 5. No key found → raise ValueError
-```
+The function resolves keys, base URL, and model name with a **priority: CLI flag > environment variable > auto-detected default**. The resolution order is:
 
-**Key behaviors**:
-- **Priority**: Google Gemini takes precedence over OpenAI-compatible. If both keys are set, Gemini is used.
-- **Whitespace sanitization**: Both `openai_key` and `google_key` are trimmed with `.strip()` to guard against accidental leading/trailing spaces in `.env` files.
-- **DeepSeek auto-detection**: If the key structure matches `sk-` followed by exactly 32 hexadecimal characters, the agent treats it as a DeepSeek key. It automatically overrides the base URL to `"https://api.deepseek.com"` (unless a non-OpenAI URL is explicitly set) and the model to `"deepseek-chat"`.
-- **Model name resolution**: `MODEL_NAME` is the universal override; `GOOGLE_MODEL_NAME` is Gemini-specific. This allows the user to configure the provider via key selection and the model independently.
-- **`FilesystemBackend`** is instantiated with `root_dir=target_directory` and `virtual_mode=False`. This means all file operations performed by the agent (like `read_file`, `write_file`, `glob`) directly touch the real filesystem within the target directory's scope.
+1. **Resolve keys**: `api_key` (CLI) wins; otherwise read `OPENAI_API_KEY`. Gemine keys (`GOOGLE_API_KEY` / `GEMINI_API_KEY`) are only considered when no explicit CLI key is given.
+2. **Strip whitespace** from all resolved keys.
+3. **Resolve base URL**: `base_url` (CLI) > `OPENAI_BASE_URL` env var.
+4. **Resolve model name**: `model_name` (CLI) > `MODEL_NAME` env var.
+5. **Azure AI serverless branch** — if `AZURE_OPENAI_API_KEY` is set:
+   - Constructs `base_url = "{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT_NAME}"`, preserving the standard OpenAI request body (Model-as-a-Service).
+   - Injects the `api-version` query param and `api-key` header.
+   - Returns a `ChatOpenAI` configured for the deployment.
+6. **Google Gemini branch** — if `google_key` is set:
+   - Resolves model: `model_name` (CLI) > `GOOGLE_MODEL_NAME` > `"gemini-1.5-flash"`.
+   - Returns `ChatGoogleGenerativeAI(model, google_api_key)`.
+7. **OpenAI / DeepSeek branch** — if `openai_key` is set:
+   - **Auto-detect DeepSeek**: if the key body (after stripping a leading `sk-`) is exactly 32 hex characters, it is treated as DeepSeek. The base URL is redirected to `https://api.deepseek.com` (unless a non-OpenAI URL was explicitly configured) and the model defaults to `deepseek-chat`.
+   - Otherwise the resolved model defaults to `gpt-4o-mini` and the configured/default OpenAI base URL is used.
+   - Returns `ChatOpenAI(model, api_key, base_url)`.
+
+> **Note on provider precedence**: Gemini is checked *before* the OpenAI-compatible branch, so if both a Gemini key and an OpenAI/DeepSeek key are present, Gemini is used (unless an explicit CLI key selects otherwise).
 
 ### 3. System Prompt (`DOC_INSTRUCTIONS`)
 
-The system prompt embedded in `agent.py` instructs the LLM to:
+The `DOC_INSTRUCTIONS` constant embedded in `agent.py` instructs the LLM to:
 
 1. **Plan the audit** using the `write_todos` tool.
 2. **Explore** entry points and code structure via `ls`, `read_file`, `glob`, `grep`.
-3. **Generate documentation** in the `docs/` folder:
-   - `docs/overview.md` — project summary, features, folder structure.
-   - `docs/architecture.md` — design explanation and module interactions.
-   - `docs/api_reference.md` — detailed class, function, and workflow docs.
-4. **Remain thorough** — no placeholder text, all documentation must be polished and detailed.
-5. **Always write inside `docs/`** — the prompt explicitly forbids writing documentation files outside the `docs/` directory.
+3. **Write all documentation inside the `docs/` folder** — nothing outside it.
+4. Generate structured output: `docs/overview.md` (summary, features, folder structure), plus any additional files determined during the audit.
+5. Remain thorough and polished — **no placeholder text**.
 
-### 3. System Prompt (`DOC_INSTRUCTIONS`)
+### 4. Security Deny-Rules (`FilesystemPermission`)
 
-The system prompt embedded in `agent.py` instructs the LLM to:
+Uniquely, `run_doc_agent` applies a **deny permission** that blocks the agent from reading sensitive files, in addition to the filesystem scope:
 
-1. **Plan the audit** using the `write_todos` tool.
-2. **Explore** entry points and code structure via `ls`, `read_file`, `glob`, `grep`.
-3. **Generate documentation** in the `docs/` folder:
-   - `docs/overview.md` — project summary, features, folder structure.
-   - `docs/architecture.md` — design explanation and module interactions.
-   - `docs/api_reference.md` — detailed class, function, and workflow docs.
-4. **Remain thorough** — no placeholder text, all documentation must be polished and detailed.
-5. **Always write inside `docs/`** — the prompt explicitly forbids writing documentation files outside the `docs/` directory.
+- Paths matched (absolute-style, nested-glob): `/.env`, `/**/.env`, `/.gitignore`, `/**/.gitignore`.
+- Operation: `read`, mode: `deny`.
+
+This duplicates the deny rules at the prompt level to handle whatever path-matching strategy the `FilesystemBackend` uses.
 
 ---
 
@@ -149,38 +137,34 @@ The system prompt embedded in `agent.py` instructs the LLM to:
 
 ### Agent Pattern (DeepAgents)
 
-The project uses **DeepAgents** (`create_deep_agent`), a framework that wraps an LLM into an autonomous agent capable of:
+The project uses **DeepAgents** (`create_deep_agent`), which wraps an LLM into an autonomous agent capable of:
 
-- Calling tools (read/write files, search, glob, grep)
+- Calling tools (read/write/search files)
 - Planning multi-step objectives with `write_todos`
-- Chaining multiple steps to fulfill a complex objective (observe → reason → act → observe)
-- Iterating and self-correcting based on intermediate results
+- Chaining steps (observe → reason → act → observe)
+- Iterating and self-correcting on intermediate results
 
-This is the core pattern — the LLM is **not** prompted to generate documentation in one shot. Instead, it is given a toolset and asked to **explore, plan, and write** iteratively, just as a human technical writer would.
+This is the core pattern — the LLM is **not** asked to generate documentation in one shot. It is given a toolset and instructed to **explore, plan, and write** iteratively, like a human technical writer.
 
 ### Router Pattern (Model Selection)
 
-`get_model()` implements a **priority-based router**:
-
-1. Google Gemini (highest priority — checked first)
-2. OpenAI-compatible (fallback — includes standard OpenAI, DeepSeek, and custom endpoints)
-3. Error: no API key configured
-
-Within the OpenAI-compatible branch, a **DeepSeek auto-detection sub-router** overrides default base URL and model name when a DeepSeek-format key is detected, removing the need for manual configuration.
+`get_model()` implements a **priority-based router**: Azure → Google Gemini → OpenAI-compatible (OpenAI / DeepSeek / custom). Within the OpenAI-compatible branch, a **DeepSeek auto-detection sub-router** overrides the base URL and model for DeepSeek-format keys.
 
 ### CLI Argument Pattern (argparse)
 
-Uses Python's standard `argparse` module with:
-- One **positional argument** (`directory`) — the target codebase path, defaults to `"."`
-- One **optional flag** (`--instructions` / `-i`) — custom guidance for the documentation agent
+Uses Python's standard `argparse` with one positional argument (`directory`, default `"."`) and four optional flags (`--instructions`, `--api-key`, `--model`, `--base-url`), plus automatic `--help`.
 
 ### Filesystem Sandbox Pattern
 
-`FilesystemBackend(root_dir=target_directory, virtual_mode=False)` restricts all file read/write operations to the target directory and its subdirectories. This provides safety against accidental modifications outside the project, while still allowing full read/write access within the target.
+`FilesystemBackend(root_dir=abs_target_dir, virtual_mode=True)` scopes all file operations to the target project while operating on the real filesystem (virtual path resolution). Combined with the `FilesystemPermission` deny rule, this provides strong isolation and guards against leaking sensitive files.
+
+### Streaming / Observer Pattern
+
+Instead of a single `invoke`, `run_doc_agent` iterates over `agent.astream(...)`. Each event is inspected; tool outputs are summarized and printed, tool calls (name + args) are logged, and model responses are streamed — giving the user live visibility into the agent's reasoning and actions.
 
 ### Async Wrapper Pattern
 
-Since DeepAgents' `ainvoke()` is async, `main.py` wraps the call with `asyncio.run()`. This bridges the synchronous CLI entry point to the async agent execution model cleanly.
+`main.py` bridges the synchronous CLI entry point to the async agent model via `asyncio.run()`.
 
 ---
 
@@ -188,55 +172,62 @@ Since DeepAgents' `ainvoke()` is async, `main.py` wraps the call with `asyncio.r
 
 ### Step-by-Step Runtime Walkthrough
 
-1. **User invokes CLI**: `python main.py /path/to/project -i "Focus on API"`
+1. **User invokes CLI**: `doc-agent /path/to/project -i "Focus on API" --api-key KEY`
 2. **main.py**:
-   - Reconfigures stdout to UTF-8 if on Windows
+   - Reconfigures UTF-8 output on Windows
    - Loads `.env` via `load_dotenv()`
-   - Parses arguments → `directory="/path/to/project"`, `instructions="Focus on API"`
-   - Prints banner with config info
-   - Calls `asyncio.run(run_doc_agent("/path/to/project", "Focus on API"))`
+   - Parses arguments → `directory`, `instructions`, `api_key`, `model`, `base_url`
+   - Prints the config banner
+   - Calls `asyncio.run(run_doc_agent(...))`
 3. **agent.py** (`run_doc_agent`):
-   - Prints `"🚀 Initializing Deep Documentation Agent for: /path/to/project"`
-   - Calls `get_model()` → resolves LLM provider
-   - Creates agent with `FilesystemBackend(root_dir="/path/to/project")` and `DOC_INSTRUCTIONS` system prompt
-   - Builds user prompt and calls `agent.ainvoke({...})`
+   - Resolves and prints the absolute target directory
+   - Calls `get_model()` → returns the appropriate LangChain chat model
+   - Builds the `FilesystemPermission` deny rule for `.env` / `.gitignore`
+   - Creates the deep agent with the backend, system prompt, and permissions
+   - Builds the user prompt (appending custom instructions if any)
+   - Streams `astream(...)` events, printing tool outputs, tool calls, and model responses
+   - Captures the final model message as the return value
 4. **Deep Agent** (autonomous loop):
-   - Receives user prompt + system instructions
-   - Plans audit using `write_todos`
-   - Explores codebase with `ls`, `glob`, `read_file`, `grep`
-   - Analyzes module structure and dependencies
-   - Writes `docs/overview.md`, `docs/architecture.md`, `docs/api_reference.md`
-   - Returns final response to caller
-5. **main.py**: Prints agent's final message and success banner
+   - Plans the audit with `write_todos`
+   - Explores with `ls`, `glob`, `read_file`, `grep`
+   - Analyzes structure and dependencies
+   - Writes `docs/overview.md` and related files
+   - Returns its final message
+5. **main.py**: Prints the success banner and the agent's final response.
 
 ---
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | Optional* | — | API key for OpenAI or DeepSeek |
-| `OPENAI_BASE_URL` | Optional | — | Base URL override (e.g., `https://api.deepseek.com`) |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Optional* | — | API key for Google Gemini |
-| `MODEL_NAME` | Optional | `"gpt-4o-mini"` (OpenAI) / `"gemini-1.5-flash"` (Gemini) | Override model name for the active provider |
-| `GOOGLE_MODEL_NAME` | Optional | `"gemini-1.5-flash"` | Specific model name for Gemini provider |
+| Variable | Role | Description |
+|----------|------|-------------|
+| `OPENAI_API_KEY` | Provider key | API key for OpenAI or DeepSeek |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Provider key | API key for Google Gemini |
+| `AZURE_OPENAI_API_KEY` | Provider key | Enables the Azure AI serverless (MaaS) path |
+| `AZURE_OPENAI_ENDPOINT` | Azure config | Azure endpoint (used with the deployment name) |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure config | Azure deployment/model name |
+| `AZURE_OPENAI_API_VERSION` | Azure config | API version (default `2024-02-01`) |
+| `OPENAI_BASE_URL` | Config | Custom OpenAI-compatible base URL |
+| `MODEL_NAME` | Config | Universal model-name override |
+| `GOOGLE_MODEL_NAME` | Config | Gemini-specific model-name override (default `gemini-1.5-flash`) |
 
-\* At least one of `OPENAI_API_KEY` or `GOOGLE_API_KEY` / `GEMINI_API_KEY` must be set.
+CLI flags (`--api-key`, `--model`, `--base-url`) always take precedence over the matching environment variables.
 
 ---
 
-## Threading & Concurrency Model
+## Concurrency Model
 
-- **main.py** runs synchronously with a single call to `asyncio.run()`, which creates a single event loop.
-- **agent.py** uses `await agent.ainvoke()` — the deep agent's execution is async but single-threaded from the Python perspective.
-- Inside the **Deep Agent**, the LLM makes sequential tool calls and LLM inferences. There is no parallelism within a single agent invocation.
-- Overall, the system is **single-threaded, asynchronous** — appropriate for I/O-bound operations like file reads, LLM API calls, and file writes.
+- **main.py** runs synchronously, invoking a single `asyncio.run()` event loop.
+- **agent.py** drives the deep agent via `async for event in agent.astream(...)` — execution is async but single-threaded from Python's perspective.
+- Within one agent run, tool calls and LLM inference happen sequentially.
+- Overall the system is **single-threaded, asynchronous**, well-suited to I/O-bound work (file access and LLM API calls).
 
 ---
 
 ## Security & Isolation
 
-- **Filesystem scope**: The `FilesystemBackend` restricts all file operations to the `root_dir` provided. The agent cannot read or write files outside the target directory.
-- **API keys**: Loaded from `.env` file (which is `.gitignore`-listed) or environment variables — never hard-coded.
-- **LLM communication**: All API calls are made over HTTPS to the configured LLM provider. No data is stored or logged by the tool itself.
+- **Filesystem scope**: `FilesystemBackend` restricts all reads/writes to the target `root_dir`.
+- **Sensitive-file denial**: A `FilesystemPermission` deny rule prevents the agent from reading `.env` or `.gitignore` files at any nesting depth, regardless of path-matching style.
+- **API keys**: Supplied via CLI flags, environment variables, or a `.env` file (git-ignored and denied to the agent) — never hard-coded.
+- **LLM communication**: All API calls go over HTTPS to the configured provider.
 

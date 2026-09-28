@@ -1,6 +1,6 @@
 # Doc Agent — API Reference
 
-This document provides detailed documentation for every function, module, and configuration file in the Doc Agent codebase.
+This document provides detailed reference for every function, module, and configuration surface in the Doc Agent codebase.
 
 ---
 
@@ -33,6 +33,7 @@ if sys.platform.startswith("win"):
         pass
 ```
 
+Reconfigures stdout/stderr to UTF-8 on Windows so emoji and Markdown characters display correctly in `cmd.exe` and PowerShell.
 
 #### Environment Loading
 
@@ -40,13 +41,13 @@ if sys.platform.startswith("win"):
 load_dotenv()
 ```
 
-Loads environment variables from the `.env` file in the current working directory before any other logic runs. This is called at module import time, so API keys are available when `main()` executes.
+Loads environment variables from the `.env` file in the current working directory at import time, so API keys are available before `main()` runs.
 
 ### Functions
 
 #### `main()`
 
-The main entry point for the CLI tool. Called when `python main.py` is run.
+The main entry point for the CLI tool. Declared as the `doc-agent` console script in `pyproject.toml`.
 
 **Signature**:
 ```python
@@ -54,35 +55,21 @@ def main() -> None
 ```
 
 **Behavior**:
-1. Creates an `ArgumentParser` with description `"CLI Documentation Writer - Automate generating beautiful markdown docs for your codebases."`
-2. Configures two arguments:
-   - `directory` (positional, optional): Path to the codebase to document. Defaults to `"."`.
-   - `--instructions` / `-i` (optional): Custom guidance text for the agent.
-3. Prints a styled ASCII banner showing the target directory and any custom instructions.
-4. Calls `asyncio.run(run_doc_agent(directory, instructions))`.
-5. On success: Prints `"Documentation Process Completed successfully!"` and the agent's final response.
+1. Creates an `argparse.ArgumentParser` with program name `doc-agent`, a provider-aware description, and `RawDescriptionHelpFormatter`.
+2. Configures five arguments:
+   - `directory` (positional, optional): Target codebase path. Defaults to `"."`.
+   - `--instructions` / `-i`: Custom guidance text for the agent. Defaults to `""`.
+   - `--api-key` / `-k`: Explicit LLM API key (OpenAI, Gemini, or DeepSeek). Defaults to `None`.
+   - `--model` / `-m`: Model name override (e.g. `gpt-4o`, `gemini-1.5-pro`, `deepseek-chat`). Defaults to `None`.
+   - `--base-url`: Custom OpenAI-compatible API base URL. Defaults to `None`.
+3. Prints a styled ASCII banner showing the target directory and any supplied instructions, model override, or base URL.
+4. Calls `asyncio.run(run_doc_agent(directory, instructions, api_key=args.api_key, model_name=args.model, base_url=args.base_url))`.
+5. On success: Prints a success banner and the agent's final response.
 6. On failure: Prints the exception to stderr and calls `sys.exit(1)`.
 
 **Example**:
 ```bash
-python main.py /home/user/my-project -i "Focus on API endpoints"
-```
-
-**Full output example**:
-```
-DOCUMENTATION WRITER             
-Target Directory: /home/user/my-project
-Custom Instructions: Focus on API endpoints
-
-
-Initializing Deep Documentation Agent for: /home/user/my-project
-Using OpenAI-compatible Model: gpt-4o-mini (Base URL: default)
-... [agent runs and generates docs] ...
-
-
-Documentation Process Completed successfully!
-
-[agent's final response]
+doc-agent ./my-project --api-key KEY --model gpt-4o --instructions "Focus on API endpoints"
 ```
 
 ---
@@ -91,7 +78,7 @@ Documentation Process Completed successfully!
 
 **Path**: `agent.py`
 
-Core module that selects the LLM provider, builds the deep agent, and invokes it against the target codebase.
+Core module that selects the LLM provider, builds the deep agent with a scoped filesystem backend and security deny-rules, and streams the agent's execution.
 
 ### Imports
 
@@ -99,15 +86,15 @@ Core module that selects the LLM provider, builds the deep agent, and invokes it
 import os
 import asyncio
 from langchain_openai import ChatOpenAI
-from deepagents import create_deep_agent
+from deepagents import create_deep_agent, FilesystemPermission
 from deepagents.backends import FilesystemBackend
 ```
 
 - `os` — Reading environment variables for API keys and configuration.
-- `asyncio` — Although the function is async, `asyncio` is imported for potential future async utility.
-- `ChatOpenAI` — LangChain's OpenAI-compatible chat model wrapper (used for both OpenAI and DeepSeek).
-- `create_deep_agent` — The DeepAgents factory function that creates an autonomous agent with tool access.
-- `FilesystemBackend` — The backend that provides filesystem tool implementations (read, write, glob, grep, etc.) to the agent.
+- `asyncio` — Supplies `asyncio.run` usage; `run_doc_agent` is an async generator-driven coroutine.
+- `ChatOpenAI` — LangChain's OpenAI-compatible chat model wrapper (used for OpenAI, DeepSeek, and Azure serverless).
+- `create_deep_agent`, `FilesystemPermission` — Agent factory and the capability used to deny reads of sensitive files.
+- `FilesystemBackend` — Provides the filesystem tool implementations (read, write, glob, grep, etc.) to the agent.
 
 ### Constants
 
@@ -124,30 +111,28 @@ CRITICAL DIRECTIVES:
 4. Create clear, concise, and structured documentation files. Recommended files to write inside the `docs/` folder:
    - `docs/overview.md`: Summary of the project, features, and folder structure.
    - `docs/architecture.md`: Conceptual explanation of design, modules, and how they interact.
-   - `docs/api_reference.md` or component specific markdown files: Details on main classes, functions, and workflows.
-5. Make sure the documentation is extremely detailed, readable, and polished. Do not leave placeholder text.
+5. Do not leave placeholder text.
+6. NEVER read, open, or reference the `.env` or `.gitignore` files. These files contain sensitive configuration and must be completely ignored.
 """
 ```
 
-A system prompt string that tells the LLM-powered agent:
-- **Role**: expert technical writer and software architect.
-- **Constraint**: Write all output inside the `docs/` folder.
-- **Methodology**: Plan the audit using `write_todos`, then explore.
-- **Tools**: Use `ls`, `read_file`, `glob`, `grep` to understand the codebase.
-- **Outputs**: Generate three recommended files: `overview.md`, `architecture.md`, `api_reference.md`.
-- **Quality**: Extremely detailed, readable, polished — no placeholder text.
+The system prompt given to the LLM-powered agent. It establishes the role (expert technical writer & software architect), requires that all output be written inside the `docs/` folder, directs the agent to plan with `write_todos` and explore with `ls`/`read_file`/`glob`, and forbids reading `.env` / `.gitignore` at both the prompt level and via permissions.
 
 ### Functions
 
 #### `run_doc_agent()`
 
-Initializes and invokes the deep agent to audit a codebase and write documentation.
+Initializes and invokes the deep agent to audit a codebase and write documentation, streaming progress to the console.
 
 **Signature**:
 ```python
 async def run_doc_agent(
     target_directory: str,
-    specific_instructions: str = ""
+    specific_instructions: str = "",
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
 ) -> str
 ```
 
@@ -156,98 +141,99 @@ async def run_doc_agent(
 |-----------|------|---------|-------------|
 | `target_directory` | `str` | — | Absolute or relative path to the codebase root to document |
 | `specific_instructions` | `str` | `""` | Optional custom guidance appended to the agent prompt |
+| `api_key` | `str \| None` | `None` | Explicit LLM API key (OpenAI, Gemini, or DeepSeek) |
+| `model_name` | `str \| None` | `None` | Model name override, e.g. `gpt-4o`, `gemini-1.5-pro`, `deepseek-chat` |
+| `base_url` | `str \| None` | `None` | Custom OpenAI-compatible API base URL |
+
+The last three parameters are keyword-only.
 
 **Returns**:
 | Type | Description |
 |------|-------------|
-| `str` | The content of the final message from the agent (the agent's concluding response) |
+| `str` | The content of the final model message (the agent's concluding response) |
 
 **Raises**:
 | Exception | Condition |
 |-----------|-----------|
-| `ValueError` | When no API key is configured (propagated from `get_model()`) |
+| `ValueError` | When no API key can be resolved (propagated from `get_model()`) |
 | Various | Any LangChain or DeepAgents exceptions during agent execution |
 
 **Behavior**:
-1. Prints `"Initializing Deep Documentation Agent for: {target_directory}"`.
-2. Calls `get_model()` to obtain the appropriate LLM instance.
-3. Creates a deep agent using `create_deep_agent()` with:
-   - The selected LLM model.
-   - A `FilesystemBackend` rooted at `target_directory` with `virtual_mode=False` (real filesystem access, not sandboxed virtual layer).
+1. Resolves and prints the absolute target directory (`os.path.abspath`).
+2. Calls `get_model(api_key=..., model_name=..., base_url=...)` to obtain the appropriate LangChain chat model.
+3. Builds a `FilesystemPermission` deny rule (`operations=["read"]`, `mode="deny"`) covering `/.env`, `/**/.env`, `/.gitignore`, and `/**/.gitignore` to block sensitive-file reads across path-matching styles.
+4. Creates the deep agent with:
+   - The selected model.
+   - `FilesystemBackend(root_dir=abs_target_dir, virtual_mode=True)` — file operations scoped to the target and resolved virtually.
    - The `DOC_INSTRUCTIONS` system prompt.
-4. Builds a user prompt that instructs the agent to audit the codebase at `target_directory` and write comprehensive markdown documentation.
-5. Appends `specific_instructions` to the prompt if provided.
-6. Invokes the agent via `agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})`.
-7. Extracts the final message from the result dictionary: `result["messages"][-1].content`.
-8. Returns the final message content as a string.
+   - `permissions=[denied_files]`.
+5. Builds a user prompt telling the agent to audit the current workspace and write docs into `docs/`, appending `specific_instructions` if provided.
+6. Iterates `async for event in agent.astream({...})` and, for each event, prints:
+   - **Tool outputs** under a `💻 Tool [...]` label with long outputs truncated to ~120 chars.
+   - **Model responses** under a `🧠 Agent response:` label.
+   - **Tool calls** under a `🔍 Agent decided to run tool [...]` label with their arguments.
+7. Captures the last non-empty model message as the final answer and returns it.
 
 **Example**:
 ```python
-result = await run_doc_agent("/home/user/project", "Highlight security concerns")
+result = await run_doc_agent(
+    "/home/user/project",
+    "Highlight security concerns",
+    api_key="sk-...",
+    base_url="https://api.deepseek.com",
+)
 print(result)
 ```
-
-**Internal workings**:
-- The `agent.ainvoke()` call triggers the autonomous agent loop:
-  1. LLM receives the system prompt (`DOC_INSTRUCTIONS`) and user prompt.
-  2. LLM decides which tools to call (e.g., `write_todos` to plan, `ls` to explore, `read_file` to read source code).
-  3. The FilesystemBackend executes the tool calls and returns results.
-  4. LLM processes results and decides next action (more exploration, or writing documentation).
-  5. The loop continues until the LLM determines the task is complete.
-  6. The final LLM response is returned as the result.
 
 ---
 
 #### `get_model()`
 
-Selects and returns the appropriate LLM instance based on available API keys.
+Resolves and returns the appropriate LangChain chat model based on API keys and configuration, with a **CLI flag > environment variable > default** priority for each value.
 
 **Signature**:
 ```python
-def get_model() -> Union[ChatOpenAI, ChatGoogleGenerativeAI]
+def get_model(
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+) -> ChatOpenAI | ChatGoogleGenerativeAI
 ```
+
+All parameters are keyword-only.
 
 **Returns**:
 | Return Type | Condition |
 |------------|-----------|
-| `ChatGoogleGenerativeAI` | When `GOOGLE_API_KEY` or `GEMINI_API_KEY` is set |
-| `ChatOpenAI` | When `OPENAI_API_KEY` is set (and no Google key is present) |
+| `ChatGoogleGenerativeAI` | When a Gemini key resolves (and no Azure key is present) |
+| `ChatOpenAI` | When an OpenAI/DeepSeek key resolves, or when using Azure serverless |
 
 **Raises**:
 | Exception | Condition |
 |-----------|-----------|
-| `ValueError` | When neither `OPENAI_API_KEY` nor `GOOGLE_API_KEY` / `GEMINI_API_KEY` is set |
+| `ValueError` (via `ChatOpenAI`) | When neither an OpenAI/DeepSeek key nor a Gemini key nor Azure credentials can be resolved |
 
 **Behavior**:
-1. Reads `OPENAI_API_KEY`, `GOOGLE_API_KEY`, and `GEMINI_API_KEY` from environment variables via `os.environ.get()`.
-2. Strips leading/trailing whitespace from all found keys using `.strip()` (protects against accidental spaces in `.env`).
-3. **Priority**: Google Gemini > OpenAI-compatible. If a Google key is present, it takes precedence.
-4. **If Gemini is selected**:
-   - Model name resolution: `MODEL_NAME` → `GOOGLE_MODEL_NAME` → `"gemini-1.5-flash"` (default).
-   - Returns `ChatGoogleGenerativeAI(model=model_name, google_api_key=google_key)`.
-5. **If OpenAI-compatible is selected**:
-   - Reads optional `OPENAI_BASE_URL` and strips whitespace.
-   - Reads optional `MODEL_NAME`.
-   - **DeepSeek auto-detection logic**:
-     - Checks if the key starts with `"sk-"` and has exactly 32 hex characters after the prefix.
-     - Detection code:
-       ```python
-       key_body = openai_key[3:] if openai_key.startswith("sk-") else openai_key
-       is_deepseek_key = (len(key_body) == 32 and all(c in "0123456789abcdefABCDEF" for c in key_body))
-       ```
-     - If detected as DeepSeek:
-       - Auto-sets `base_url` to `"https://api.deepseek.com"` (unless a non-OpenAI base URL is already explicitly set).
-       - Auto-sets `model_name` to `"deepseek-chat"` (if not explicitly configured or still set to the default `"gpt-4o-mini"`).
-   - Default model is `"gpt-4o-mini"` if nothing is configured.
-   - Returns `ChatOpenAI(model=model_name, api_key=openai_key, base_url=base_url if base_url else None)`.
+1. **Resolve keys**: `api_key` (CLI) wins over `OPENAI_API_KEY`. Gemini keys (`GOOGLE_API_KEY` / `GEMINI_API_KEY`) are only read when no explicit CLI key was passed. All keys are `.strip()`-ed.
+2. **Resolve base URL**: `base_url` (CLI) > `OPENAI_BASE_URL` env var. `.strip()`-ed.
+3. **Resolve model name**: `model_name` (CLI) > `MODEL_NAME` env var.
+4. **Azure AI serverless branch** — if `AZURE_OPENAI_API_KEY` is set:
+   - Builds `base_url = f"{endpoint}/openai/deployments/{deployment}"` and injects `api-version` (default `2024-02-01`) and `api-key` headers via `ChatOpenAI`.
+   - Returns `ChatOpenAI(model=deployment, ...)`.
+5. **Google Gemini branch** — if a Gemini key resolved:
+   - Model: `model_name` (CLI) > `GOOGLE_MODEL_NAME` > `"gemini-1.5-flash"`.
+   - Returns `ChatGoogleGenerativeAI(model=resolved_model, google_api_key=google_key)`.
+6. **OpenAI / DeepSeek branch** — if `openai_key` resolved:
+   - **DeepSeek auto-detection**: if the key body (after stripping a leading `sk-`) is exactly 32 hex characters, it is treated as DeepSeek:
+     - Redirects `base_url` to `https://api.deepseek.com` when no base URL is set or when it still references `openai.com`.
+     - Sets `model_name` to `deepseek-chat` when unset or still the default `gpt-4o-mini`.
+   - Default model is `gpt-4o-mini`.
+   - Returns `ChatOpenAI(model=resolved_model, api_key=openai_key, base_url=base_url or None)`.
 
+> Provider precedence: Azure is checked first, then Gemini, then OpenAI/DeepSeek. If both a Gemini key and an OpenAI/DeepSeek key are present (and no CLI key is given), Gemini wins.
 
-
-
-
-
-
-
+---
 
 ## Configuration Files
 
@@ -255,79 +241,69 @@ def get_model() -> Union[ChatOpenAI, ChatGoogleGenerativeAI]
 
 **Path**: `.env`
 
-Environment variable configuration file. **Not committed to git** (listed in `.gitignore`).
+Environment variable configuration file. Not committed to git, and explicitly denied to the agent by the `FilesystemPermission` deny rule.
 
-| Variable | Example Value | Purpose |
-|----------|--------------|---------|
-| `OPENAI_API_KEY` | `sk-...` | API key for OpenAI or DeepSeek |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL override for compatible APIs |
-| `GOOGLE_API_KEY` | `AIzaSy...` | API key for Google Gemini |
-| `GEMINI_API_KEY` | `AIzaSy...` | Alias for `GOOGLE_API_KEY` |
-| `MODEL_NAME` | `gpt-4o-mini` | Override the model name for the selected provider |
-| `GOOGLE_MODEL_NAME` | `gemini-1.5-flash` | Gemini-specific model name override |
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | API key for OpenAI or DeepSeek |
+| `OPENAI_BASE_URL` | Custom OpenAI-compatible base URL |
+| `GOOGLE_API_KEY` | API key for Google Gemini |
+| `GEMINI_API_KEY` | Alias for `GOOGLE_API_KEY` |
+| `MODEL_NAME` | Model-name override for the active provider |
+| `GOOGLE_MODEL_NAME` | Gemini-specific model name (default `gemini-1.5-flash`) |
+| `AZURE_OPENAI_API_KEY` | Enables the Azure AI serverless path |
+| `AZURE_OPENAI_ENDPOINT` | Azure endpoint |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure deployment/model name |
+| `AZURE_OPENAI_API_VERSION` | Azure API version (default `2024-02-01`) |
 
 ### `pyproject.toml`
 
 **Path**: `pyproject.toml`
 
-Project configuration file used by `uv` and `pip`.
+Project configuration used by `pip` and `uv`.
 
-#### Fields
+#### Core Fields
 
 | Field | Value |
 |-------|-------|
 | `name` | `"doc-agent"` |
 | `version` | `"0.1.0"` |
-| `description` | `"Add your description here"` |
+| `description` | `"AI-powered CLI tool that automatically generates markdown documentation for any codebase."` |
 | `readme` | `"README.md"` |
 | `requires-python` | `">=3.13"` |
+| `license` | `"MIT"` |
+
+#### Console Script
+
+```toml
+[project.scripts]
+doc-agent = "main:main"
+```
+
+Installs the `doc-agent` command, which calls `main.main()`.
+
+#### Packaging
+
+```toml
+[tool.setuptools]
+py-modules = ["agent", "main"]
+```
+
+Declares `agent` and `main` as top-level modules.
 
 #### Dependencies
 
 | Package | Version Constraint | Purpose |
 |---------|-------------------|---------|
-| `adapter` | `>=0.1` | Adapter pattern utilities for flexible integrations |
-| `deepagents` | `>=0.6.2` | Agent orchestration framework with filesystem tool backends |
-| `deepseek` | `>=1.0.0` | Official DeepSeek API client library |
-| `langchain` | `>=1.3.1` | Core LLM abstraction framework (prompts, chains, calls) |
-| `langchain-google-genai` | `>=4.2.2` | Google Gemini provider integration for LangChain |
-| `langchain-mcp-adapters` | `>=0.2.2` | Adapters for Model Context Protocol (MCP) tool integration |
-| `langchain-openai` | `>=1.2.1` | OpenAI-compatible provider integration for LangChain |
-| `mcp` | `>=1.27.1` | Model Context Protocol SDK for standardized tool interfaces |
-
-### `.python-version`
-
-**Path**: `.python-version`
-
-Contains `3.13` — used by `uv` and `pyenv` to pin the Python version for the virtual environment.
-
-### `.gitignore`
-
-**Path**: `.gitignore`
-
-Excludes the following from version control:
-
-```
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-.env
-```
-
----
-
-## Module: `README.md`
-
-**Path**: `README.md`
-
-Currently a placeholder file (empty). Intended to be populated with project description, installation instructions, and usage examples. The Doc Agent's generated documentation inside `docs/` serves as the primary documentation for audited codebases.
+| `adapter` | `>=0.1` | Adapter-pattern utilities |
+| `deepagents` | `>=0.6.2` | Agent orchestration framework with filesystem backends |
+| `deepseek` | `>=1.0.0` | DeepSeek API client support |
+| `langchain` | `>=1.3.1` | Core LLM abstraction framework |
+| `langchain-google-genai` | `>=4.2.2` | Google Gemini provider integration |
+| `langchain-mcp-adapters` | `>=0.2.2` | MCP protocol adapters for LangChain |
+| `langchain-openai` | `>=1.2.1` | OpenAI-compatible provider integration |
+| `mcp` | `>=1.27.1` | Model Context Protocol SDK |
+| `python-dotenv` | `>=1.0.0` | Load `.env` files at startup |
 
 ---
 
@@ -337,8 +313,6 @@ Currently a placeholder file (empty). Intended to be populated with project desc
 |------|-----------|
 | `0` | Documentation process completed successfully |
 | `1` | Error occurred during agent execution (exception caught in `main()`) |
-
----
 
 ## Type Reference
 
@@ -378,7 +352,7 @@ agent = create_deep_agent(
     model,                          # ChatOpenAI | ChatGoogleGenerativeAI
     backend=FilesystemBackend(
         root_dir="/path/to/target",
-        virtual_mode=False
+        virtual_mode=True
     ),
     system_prompt="..."              # Instructions passed to the agent
 )
@@ -394,7 +368,7 @@ agent = create_deep_agent(
 ### FilesystemBackend
 
 ```python
-FilesystemBackend(root_dir="/path", virtual_mode=False)
+FilesystemBackend(root_dir="/path", virtual_mode=True)
 ```
 
 | Parameter | Type | Default | Description |

@@ -1,9 +1,20 @@
 [project]
 name = "doc-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-powered CLI tool that automatically generates markdown documentation for any codebase."
 readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+keywords = ["documentation", "ai", "agent", "cli", "markdown", "codegen"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Documentation",
+    "Topic :: Software Development :: Documentation",
+]
 dependencies = [
     "adapter>=0.1",
     "deepagents>=0.6.2",
@@ -13,4 +24,11 @@ dependencies = [
     "langchain-mcp-adapters>=0.2.2",
     "langchain-openai>=1.2.1",
     "mcp>=1.27.1",
+    "python-dotenv>=1.0.0",
 ]
+
+[project.scripts]
+doc-agent = "main:main"
+
+[tool.setuptools]
+py-modules = ["agent", "main"]

@@ -17,20 +17,41 @@ CRITICAL DIRECTIVES:
 6. NEVER read, open, or reference the `.env` or `.gitignore` files. These files contain sensitive configuration and must be completely ignored.
 """
 
-async def run_doc_agent(target_directory: str, specific_instructions: str = ""):
+async def run_doc_agent(
+    target_directory: str,
+    specific_instructions: str = "",
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+):
     """
     Initializes and invokes the deep agent to audit a codebase and write markdown documentation.
+
+    Args:
+        target_directory: Path to the codebase directory to document.
+        specific_instructions: Optional extra guidance for the agent.
+        api_key: LLM API key (OpenAI, Gemini, or DeepSeek). Falls back to env vars if not provided.
+        model_name: Override the model to use (e.g. 'gpt-4o', 'gemini-1.5-pro').
+        base_url: Custom OpenAI-compatible base URL for non-OpenAI providers.
     """
     # Resolve absolute path of the target directory to ensure robust backend scoping
     abs_target_dir = os.path.abspath(target_directory)
     print(f"🚀 Initializing Deep Documentation Agent for target: {abs_target_dir}")
-    
-    model = get_model()
 
-    # Deny the agent from reading sensitive/config files
+    model = get_model(api_key=api_key, model_name=model_name, base_url=base_url)
+
+    # Deny the agent from reading sensitive/config files.
+    # Include multiple path formats to cover all possible matching strategies
+    # used by the deepagents FilesystemBackend (absolute-style, relative, and glob).
     denied_files = FilesystemPermission(
         operations=["read"],
-        paths=["/.env", "/.gitignore"],
+        paths=[
+            "/.env",        # root .env
+            "/**/.env",     # any nested .env in subdirectories
+            "/.gitignore",  # root .gitignore
+            "/**/.gitignore", # any nested .gitignore in subdirectories
+        ],
         mode="deny",
     )
 
@@ -88,56 +109,101 @@ async def run_doc_agent(target_directory: str, specific_instructions: str = ""):
     
     return final_answer
 
-def get_model():
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    google_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    
-    # Strip whitespace if set in .env with leading spaces
+def get_model(
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+):
+    """
+    Resolves and returns the appropriate LangChain chat model.
+
+    Priority for each value: CLI flag > environment variable > auto-detected default.
+    Supports OpenAI, Google Gemini, and DeepSeek (auto-detected from key format).
+    """
+    # --- Resolve keys: CLI flag takes priority over environment variables ---
+    openai_key = api_key or os.environ.get("OPENAI_API_KEY")
+    google_key = None
+    if not api_key:
+        # Only fall back to Google env vars if no explicit key was provided via CLI
+        google_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+
+    # Strip accidental whitespace from keys loaded via .env
     if openai_key:
         openai_key = openai_key.strip()
     if google_key:
         google_key = google_key.strip()
+
+    # --- Resolve base URL: CLI flag > env var ---
+    if not base_url:
+        base_url = os.environ.get("OPENAI_BASE_URL")
+    if base_url:
+        base_url = base_url.strip()
+
+    # --- Resolve model name: CLI flag > env var ---
+    if not model_name:
+        model_name = os.environ.get("MODEL_NAME")
+
+    # --- Azure OpenAI path ---
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    if azure_key:
+        from langchain_openai import ChatOpenAI
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
+        api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01")
         
+        # Azure Model-as-a-Service (MaaS) endpoints running 3rd party models expect
+        # the standard OpenAI JSON body (including the "model" field), but are routed
+        # through the Azure deployment URL path. We use ChatOpenAI to preserve the body,
+        # but construct the Azure-specific base URL and inject the api-version query param.
+        base_url = f"{endpoint}/openai/deployments/{deployment}"
+        
+        print(f"🤖 Using Azure AI Serverless Model: {deployment}")
+        return ChatOpenAI(
+            model=deployment,
+            api_key=azure_key.strip(),
+            base_url=base_url,
+            default_query={"api-version": api_version},
+            default_headers={"api-key": azure_key.strip()}
+        )
+
+    # --- Google Gemini path ---
     if google_key:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        model_name = os.environ.get("MODEL_NAME") or os.environ.get("GOOGLE_MODEL_NAME") or "gemini-1.5-flash"
-        print(f"🤖 Using Gemini Model: {model_name}")
+        resolved_model = model_name or os.environ.get("GOOGLE_MODEL_NAME") or "gemini-1.5-flash"
+        print(f"🤖 Using Gemini Model: {resolved_model}")
         return ChatGoogleGenerativeAI(
-            model=model_name,
+            model=resolved_model,
             google_api_key=google_key,
         )
+
+    # --- OpenAI / DeepSeek path ---
     elif openai_key:
-        base_url = os.environ.get("OPENAI_BASE_URL")
-        if base_url:
-            base_url = base_url.strip()
-            
-        model_name = os.environ.get("MODEL_NAME")
-        
-        # Auto-detect if key is DeepSeek (starts with sk- followed by 32 hex digits)
-        is_deepseek_key = False
+        # Auto-detect DeepSeek key format (sk- followed by exactly 32 hex characters)
         key_body = openai_key[3:] if openai_key.startswith("sk-") else openai_key
-        if len(key_body) == 32 and all(c in "0123456789abcdefABCDEF" for c in key_body):
-            is_deepseek_key = True
-            
+        is_deepseek_key = len(key_body) == 32 and all(c in "0123456789abcdefABCDEF" for c in key_body)
+
         if is_deepseek_key:
-            # If standard OpenAI url is set but the key is a DeepSeek key, self-heal and point to DeepSeek
             if not base_url or "openai.com" in base_url:
-                print("🔄 Auto-detected DeepSeek key format! Auto-redirecting Base URL to: https://api.deepseek.com")
+                print("🔄 Auto-detected DeepSeek key! Redirecting Base URL to: https://api.deepseek.com")
                 base_url = "https://api.deepseek.com"
             if not model_name or model_name == "gpt-4o-mini":
-                print("🔄 Auto-detected DeepSeek key format! Auto-setting Model to: deepseek-chat")
-                model_name = "deepseek-v4-flash"
-        
-        if not model_name:
-            model_name = "gpt-4o-mini"
-            
-        print(f"🤖 Using OpenAI-compatible Model: {model_name} (Base URL: {base_url or 'default'})")
+                print("🔄 Auto-detected DeepSeek key! Setting model to: deepseek-chat")
+                model_name = "deepseek-chat"
+
+        resolved_model = model_name or "gpt-4o-mini"
+        print(f"🤖 Using OpenAI-compatible Model: {resolved_model} (Base URL: {base_url or 'default openai'})")
         return ChatOpenAI(
-            model=model_name,
+            model=resolved_model,
             api_key=openai_key,
             base_url=base_url if base_url else None,
         )
+
     else:
         raise ValueError(
-            "No API Key found! Please set GOOGLE_API_KEY or OPENAI_API_KEY in your .env file."
+            "No API key found!\n\n"
+            "Please provide your key using one of these methods:\n"
+            "  1. CLI flag:        doc-agent ./my-project --api-key YOUR_KEY\n"
+            "  2. Environment var: set OPENAI_API_KEY=YOUR_KEY  (or GOOGLE_API_KEY)\n"
+            "  3. .env file:       create a .env file with OPENAI_API_KEY=YOUR_KEY\n"
         )
